@@ -1,0 +1,8 @@
+name = "Bouncer"
+author = "Open Anima contributors"
+version = "1.0"
+description = "A pulsing ball bouncing around the screen. Example of the stdio protocol."
+preview = "assets/ball.png"
+# Resolved in the package folder first, then in PATH.
+command = ["python", "main.py"]
+protocol = "stdio"

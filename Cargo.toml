@@ -1,0 +1,54 @@
+[package]
+name = "open-anima"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Free desktop animation engine: put GIFs, APNGs, WebPs, sprite sheets and videos on your desktop"
+repository = "https://github.com/scottbass3/open-anima"
+readme = "README.md"
+keywords = ["desktop", "animation", "overlay", "gif", "apng"]
+categories = ["multimedia", "gui"]
+
+[features]
+default = ["ai"]
+# AI background removal (U²-Net style ONNX models, pure-Rust inference with tract).
+ai = ["dep:tract-onnx"]
+
+[dependencies]
+anyhow = "1.0.104"
+auto-launch = "0.6.0"
+crossbeam-channel = "0.5.17"
+directories = "6.0.0"
+eframe = { version = "0.35.0", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+env_logger = "0.11.11"
+image = "0.25.10"
+log = "0.4.34"
+png = "0.18.1"
+rfd = "0.17.2"
+rodio = "0.23.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
+tract-onnx = { version = "0.23.9", optional = true }
+tray-icon = "0.26.1"
+zip = "9.1.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.dev.package."*"]
+# Image decoding and inference are unbearably slow without optimisations.
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = true

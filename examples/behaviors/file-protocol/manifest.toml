@@ -1,0 +1,7 @@
+name = "File protocol demo"
+author = "Open Anima contributors"
+version = "1.0"
+description = "Pops a ball on a random screen edge every few seconds, using the file-based protocol (temp/actions.mddo + activador.act) understood for compatibility with existing desktop animation packs."
+preview = "temp/ball.png"
+command = ["python", "core.py"]
+protocol = "files"
