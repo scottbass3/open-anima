@@ -18,8 +18,9 @@ use crate::media::{self, Anim, LoadRequest, LoadResult, decode::MediaKind};
 use crate::overlay::{self, OverlayEvent, OverlayKey, Overlays, Shared, SharedRef};
 use crate::tray::{Tray, TrayMsg};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
+    #[default]
     Library,
     Behaviors,
     Settings,
@@ -115,6 +116,20 @@ impl Behavior {
     }
 }
 
+enum Thumb {
+    Loading(Receiver<Option<egui::ColorImage>>),
+    Ready(egui::TextureHandle),
+    Failed,
+}
+
+/// What a library card displays.
+pub struct CardImage {
+    pub tex: egui::TextureId,
+    pub size: Vec2,
+    /// Seconds until the image changes, for animated cards.
+    pub next: Option<f64>,
+}
+
 pub struct Notice {
     pub text: String,
     pub error: bool,
@@ -146,11 +161,15 @@ pub struct App {
     pub selected_behavior: Option<usize>,
     pub confirm_run: Option<usize>,
     pub notice: Option<Notice>,
+    pub search: String,
+    /// Still thumbnails of the items that are not loaded, keyed by what they were made from.
+    thumbs: HashMap<u64, ((PathBuf, DecodeOptions), Thumb)>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, dirs: Dirs, start_hidden: bool) -> Self {
         let ctx = &cc.egui_ctx;
+        crate::theme::apply(ctx);
         let cfg = Config::load(&dirs.config_file);
         let tray = Tray::new(ctx, cfg.lang, cfg.overlays_hidden)
             .map_err(|err| log::error!("tray icon: {err:#}"))
@@ -190,13 +209,16 @@ impl App {
             autostart_enabled,
             panel_visible,
             quitting: false,
-            tab: Tab::Library,
+            tab: Tab::default(),
             selected: None,
             selected_behavior: None,
             confirm_run: None,
             notice: None,
+            search: String::new(),
+            thumbs: HashMap::new(),
         };
         app.selected = app.cfg.items.first().map(|i| i.id);
+        app.tab = app.cfg.tab;
         app.reload_behaviors(ctx);
         for index in 0..app.behaviors.len() {
             let package = &app.behaviors[index].package;
@@ -231,6 +253,54 @@ impl App {
 
     pub fn ffmpeg(&self) -> Option<PathBuf> {
         media::video::find_ffmpeg(self.cfg.ffmpeg.as_deref())
+    }
+
+    /// The animation itself when it is loaded, a still thumbnail otherwise.
+    pub fn card_image(&mut self, ctx: &egui::Context, id: u64) -> Option<CardImage> {
+        let item = self.cfg.item(id)?;
+        if let Some(anim) = self.items.get(&id).and_then(|rt| rt.anim.as_ref()) {
+            let mut anim = anim.lock().unwrap();
+            let frame = anim.frame(media::clock(), &item.playback);
+            return Some(CardImage {
+                tex: frame.tex,
+                size: Vec2::new(anim.size[0] as f32, anim.size[1] as f32),
+                next: Some(frame.next),
+            });
+        }
+        let key = (item.source.clone(), item.decode.clone());
+        let stale = self.thumbs.get(&id).is_none_or(|(k, _)| *k != key);
+        if stale {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let ffmpeg = self.cfg.ffmpeg.clone();
+            let (source, decode) = key.clone();
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(media::thumbnail(&source, &decode, ffmpeg.as_deref()));
+                ctx2.request_repaint();
+            });
+            self.thumbs.insert(id, (key, Thumb::Loading(rx)));
+        }
+        let (_, thumb) = self.thumbs.get_mut(&id)?;
+        if let Thumb::Loading(rx) = thumb
+            && let Ok(result) = rx.try_recv()
+        {
+            *thumb = match result {
+                Some(image) => Thumb::Ready(ctx.load_texture(
+                    format!("thumb{id}"),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                )),
+                None => Thumb::Failed,
+            };
+        }
+        match thumb {
+            Thumb::Ready(tex) => Some(CardImage {
+                tex: tex.id(),
+                size: tex.size_vec2(),
+                next: None,
+            }),
+            _ => None,
+        }
     }
 
     pub fn item_status(&self, id: u64) -> ItemStatus<'_> {
@@ -420,6 +490,8 @@ impl App {
         let master = self.cfg.master_volume;
         let hidden = self.cfg.overlays_hidden;
         self.items
+            .retain(|id, _| self.cfg.items.iter().any(|i| i.id == *id));
+        self.thumbs
             .retain(|id, _| self.cfg.items.iter().any(|i| i.id == *id));
 
         for item in &mut self.cfg.items {
@@ -961,6 +1033,7 @@ impl eframe::App for App {
             self.tray_lang = self.cfg.lang;
             self.tray = Tray::new(ctx, self.cfg.lang, self.cfg.overlays_hidden).ok();
         }
+        self.cfg.tab = self.tab;
         if self.cfg != self.saved && self.last_save.elapsed() > Duration::from_secs(1) {
             self.save();
         }

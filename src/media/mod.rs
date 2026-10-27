@@ -301,6 +301,52 @@ fn load(ctx: &egui::Context, req: &LoadRequest) -> anyhow::Result<Anim> {
     }
 }
 
+/// Longest side of library thumbnails.
+const THUMB_SIDE: u32 = 256;
+
+/// First frame of a file, small, for the library grid.
+pub fn thumbnail(source: &Path, opts: &DecodeOptions, ffmpeg: Option<&Path>) -> Option<ColorImage> {
+    let first = match decode::kind_of(source) {
+        MediaKind::Video => {
+            let ffmpeg = video::find_ffmpeg(ffmpeg)?;
+            video::decode_all(&ffmpeg, source, 1).ok()?.into_iter().next()?
+        }
+        MediaKind::Image => {
+            // Decoding only the first frame is much cheaper than the whole animation.
+            let image = image::ImageReader::open(source)
+                .ok()?
+                .with_guessed_format()
+                .ok()?
+                .decode()
+                .map(|i| i.into_rgba8())
+                .or_else(|_| decode::decode_image(source).map(|f| f[0].image.clone()))
+                .ok()?;
+            let frame = RawFrame {
+                image,
+                delay: Default::default(),
+            };
+            match &opts.sprite_sheet {
+                Some(sheet) => decode::slice_sprite_sheet(vec![frame], sheet).into_iter().next()?,
+                None => frame,
+            }
+        }
+        _ => return None,
+    };
+    let mut image = first.image;
+    process::apply(&mut image, opts);
+    let (w, h) = image.dimensions();
+    if w.max(h) > THUMB_SIDE {
+        let scale = THUMB_SIDE as f32 / w.max(h) as f32;
+        image = image::imageops::resize(
+            &image,
+            ((w as f32 * scale) as u32).max(1),
+            ((h as f32 * scale) as u32).max(1),
+            image::imageops::FilterType::Triangle,
+        );
+    }
+    Some(to_color_image(&image))
+}
+
 /// Decodes every frame of any supported file with the edits of `opts` applied.
 pub fn decode_frames(
     source: &Path,

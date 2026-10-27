@@ -64,6 +64,8 @@ pub struct Config {
     pub trusted: Vec<String>,
     /// Behaviors running when the app was closed, restarted on launch.
     pub active_behaviors: Vec<PathBuf>,
+    /// Tab of the panel shown last.
+    pub tab: crate::app::Tab,
 }
 
 impl Default for Config {
@@ -80,6 +82,7 @@ impl Default for Config {
             behavior_dirs: Vec::new(),
             trusted: Vec::new(),
             active_behaviors: Vec::new(),
+            tab: Default::default(),
         }
     }
 }

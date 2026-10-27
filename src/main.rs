@@ -26,6 +26,7 @@ mod jobs;
 mod media;
 mod overlay;
 mod process;
+mod theme;
 mod tray;
 mod ui;
 
@@ -44,8 +45,10 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Open Anima")
             .with_app_id("open-anima")
-            .with_inner_size([980.0, 680.0])
-            .with_min_inner_size([640.0, 420.0])
+            .with_inner_size([1180.0, 740.0])
+            .with_min_inner_size([900.0, 560.0])
+            // The panel draws its own title bar.
+            .with_decorations(false)
             .with_icon(tray::window_icon())
             .with_drag_and_drop(true)
             // Outside Windows, overlays are egui viewports and the renderer only enables
