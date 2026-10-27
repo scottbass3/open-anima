@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
@@ -29,6 +30,16 @@ use crate::media::{self, Pixels};
 const CLASS_NAME: &str = "OpenAnimaOverlay";
 const WM_WAKE: u32 = WM_APP + 1;
 
+/// Thread running the overlays, 0 before it starts.
+static THREAD_ID: AtomicU32 = AtomicU32::new(0);
+
+pub fn wake() {
+    let id = THREAD_ID.load(Ordering::Relaxed);
+    if id != 0 {
+        unsafe { PostThreadMessageW(id, WM_WAKE, 0, 0) };
+    }
+}
+
 pub struct Native {
     tx: Sender<Vec<(SharedRef, Pos2)>>,
     thread_id: u32,
@@ -49,6 +60,7 @@ impl Native {
             })
             .expect("spawning overlay thread");
         let thread_id = id_rx.recv().unwrap_or(0);
+        THREAD_ID.store(thread_id, Ordering::Relaxed);
         Self { tx, thread_id }
     }
 
@@ -177,6 +189,9 @@ struct Window {
     next_due: Instant,
     /// Cursor offset from the window origin while dragging.
     drag: Option<(i32, i32)>,
+    /// Frames drawn and moves since `stats_since`, for the debug log.
+    stats: (u32, u32),
+    stats_since: Instant,
 }
 
 impl Window {
@@ -219,6 +234,8 @@ impl Window {
             topmost,
             next_due: Instant::now(),
             drag: None,
+            stats: (0, 0),
+            stats_since: Instant::now(),
         })
     }
 
@@ -271,6 +288,7 @@ impl Window {
                 );
             }
             self.drawn = Some(key);
+            self.stats.0 += 1;
             moved = false;
         }
         if moved {
@@ -320,7 +338,22 @@ impl Window {
             s.reported_pos = Some(p);
             if self.shown {
                 self.set_position();
+                self.stats.1 += 1;
             }
+        }
+    }
+
+    fn log_stats(&mut self, now: Instant) {
+        let elapsed = now.duration_since(self.stats_since).as_secs_f32();
+        if elapsed >= 2.0 {
+            log::debug!(
+                "overlay {:?}: {:.1} frames/s, {:.1} moves/s",
+                self.hwnd,
+                self.stats.0 as f32 / elapsed,
+                self.stats.1 as f32 / elapsed
+            );
+            self.stats = (0, 0);
+            self.stats_since = now;
         }
     }
 
@@ -439,6 +472,9 @@ fn run(rx: Receiver<Vec<(SharedRef, Pos2)>>) {
 
         let now = Instant::now();
         for window in &mut windows {
+            if log::log_enabled!(log::Level::Debug) {
+                window.log_stats(now);
+            }
             if now >= window.next_due {
                 window.render(now);
             }

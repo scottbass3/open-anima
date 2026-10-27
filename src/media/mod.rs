@@ -189,6 +189,30 @@ impl Anim {
     }
 }
 
+#[cfg(test)]
+impl Anim {
+    /// A single transparent pixel.
+    pub fn test_dummy() -> Self {
+        let img = image::RgbaImage::new(1, 1);
+        let ctx = egui::Context::default();
+        let frame = Frame {
+            tex: ctx.load_texture("test", to_color_image(&img), TextureOptions::LINEAR),
+            pixels: Pixels::from_rgba(&img),
+            delay: 1.0,
+        };
+        Self {
+            size: [1, 1],
+            audio_track: None,
+            content: Content::Frames {
+                frames: vec![frame],
+                total: 1.0,
+            },
+            clock: 0.0,
+            last_now: None,
+        }
+    }
+}
+
 pub fn to_color_image(img: &image::RgbaImage) -> ColorImage {
     ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
 }

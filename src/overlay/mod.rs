@@ -70,6 +70,12 @@ pub fn window_size(anim_px: [u32; 2], look: &Look) -> Vec2 {
     .max(Vec2::splat(1.0))
 }
 
+/// Applies pending [`Shared::move_to`] requests right away instead of at the next frame.
+pub fn wake() {
+    #[cfg(windows)]
+    win::wake();
+}
+
 /// The set of overlays to display. Every pass of the app calls [`Overlays::show`] for each
 /// overlay that should exist, then [`Overlays::flush`]; the others are closed.
 pub struct Overlays {

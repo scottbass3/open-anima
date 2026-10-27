@@ -10,18 +10,20 @@
 //!   `[1,'temp\\walk.gif','1-(100,200)']` and then `1` into `activador.act`. Open Anima reads
 //!   the action and writes `0` back.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use eframe::egui;
+use eframe::egui::{self, Pos2, Vec2};
 use serde::{Deserialize, Serialize};
 
+use crate::overlay::{self, SharedRef};
 use crate::process;
 
 pub const MANIFEST: &str = "manifest.toml";
@@ -302,11 +304,84 @@ pub fn parse_legacy(text: &str) -> Option<Command> {
     })
 }
 
+/// Overlays of a running behavior that its reader threads move directly.
+///
+/// Everything else goes through the app, whose updates are throttled to 10 per second while the
+/// panel is minimized or hidden in the tray; moves sent 60 times per second can't wait for it.
+#[derive(Default)]
+pub struct Live {
+    slots: HashMap<String, (SharedRef, Vec2)>,
+    /// Show/hide commands per slot sent to the app and not applied yet. Moves of those slots go
+    /// through the app as well, so that they stay in order.
+    pending: HashMap<String, u32>,
+    pending_clear: u32,
+}
+
+pub type LiveRef = Arc<Mutex<Live>>;
+
+impl Live {
+    /// Applies `cmd` right away when possible, otherwise returns it for the app.
+    fn route(&mut self, cmd: Command) -> Option<Command> {
+        match &cmd {
+            Command::Move { slot, x, y, anchor } => {
+                if let Some((overlay, size)) = self.slots.get(slot) {
+                    let pos = Pos2::new(*x, *y);
+                    let pos = match anchor {
+                        Anchor::Center => pos - *size / 2.0,
+                        Anchor::TopLeft => pos,
+                    };
+                    overlay.lock().unwrap().move_to = Some(pos);
+                    overlay::wake();
+                    return None;
+                }
+            }
+            Command::Show { slot, .. } | Command::Hide { slot } => {
+                *self.pending.entry(slot.clone()).or_default() += 1;
+                self.slots.remove(slot);
+            }
+            Command::Clear => {
+                self.pending_clear += 1;
+                self.slots.clear();
+            }
+            _ => {}
+        }
+        Some(cmd)
+    }
+
+    /// The app applied `cmd`, received from [`Running::commands`].
+    pub fn applied(&mut self, cmd: &Command) {
+        match cmd {
+            Command::Show { slot, .. } | Command::Hide { slot } => {
+                if let Some(n) = self.pending.get_mut(slot) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.pending.remove(slot);
+                    }
+                }
+            }
+            Command::Clear => self.pending_clear = self.pending_clear.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    /// The app displays `slot` in `overlay`, whose window has the given size.
+    pub fn publish(&mut self, slot: &str, overlay: &SharedRef, size: Vec2) {
+        if self.pending_clear == 0 && !self.pending.contains_key(slot) {
+            self.slots.insert(slot.to_owned(), (overlay.clone(), size));
+        }
+    }
+
+    pub fn unpublish(&mut self, slot: &str) {
+        self.slots.remove(slot);
+    }
+}
+
 /// A running behavior process.
 pub struct Running {
     child: Child,
     stop: Arc<AtomicBool>,
     pub commands: Receiver<Command>,
+    pub live: LiveRef,
 }
 
 impl Running {
@@ -333,22 +408,28 @@ impl Running {
 
         let (tx, rx) = unbounded();
         let stop = Arc::new(AtomicBool::new(false));
+        let live = LiveRef::default();
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
-        spawn_reader(stdout, tx.clone(), ctx.clone(), protocol != Protocol::Files);
-        spawn_reader(stderr, tx.clone(), ctx.clone(), false);
+        let sink = Sink {
+            tx,
+            live: live.clone(),
+            ctx: ctx.clone(),
+        };
+        spawn_reader(stdout, sink.clone(), protocol != Protocol::Files);
+        spawn_reader(stderr, sink.clone(), false);
         if protocol != Protocol::Stdio {
             let dir = package.dir.clone();
             let stop = stop.clone();
-            let ctx = ctx.clone();
             std::thread::Builder::new()
                 .name("behavior-files".into())
-                .spawn(move || watch_legacy_files(&dir, &tx, &ctx, &stop))?;
+                .spawn(move || watch_legacy_files(&dir, &sink, &stop))?;
         }
         Ok(Self {
             child,
             stop,
             commands: rx,
+            live,
         })
     }
 
@@ -370,12 +451,27 @@ impl Drop for Running {
     }
 }
 
-fn spawn_reader(
-    stream: impl std::io::Read + Send + 'static,
+/// Where the threads reading a behavior send its commands.
+#[derive(Clone)]
+struct Sink {
     tx: Sender<Command>,
+    live: LiveRef,
     ctx: egui::Context,
-    parse_json: bool,
-) {
+}
+
+impl Sink {
+    /// `false` once the app stopped listening.
+    fn send(&self, cmd: Command) -> bool {
+        let Some(cmd) = self.live.lock().unwrap().route(cmd) else {
+            return true;
+        };
+        let ok = self.tx.send(cmd).is_ok();
+        self.ctx.request_repaint();
+        ok
+    }
+}
+
+fn spawn_reader(stream: impl std::io::Read + Send + 'static, sink: Sink, parse_json: bool) {
     let _ = std::thread::Builder::new()
         .name("behavior-out".into())
         .spawn(move || {
@@ -391,15 +487,14 @@ fn spawn_reader(
                 } else {
                     Command::Log(line)
                 };
-                if tx.send(cmd).is_err() {
+                if !sink.send(cmd) {
                     break;
                 }
-                ctx.request_repaint();
             }
         });
 }
 
-fn watch_legacy_files(dir: &Path, tx: &Sender<Command>, ctx: &egui::Context, stop: &AtomicBool) {
+fn watch_legacy_files(dir: &Path, sink: &Sink, stop: &AtomicBool) {
     let trigger = dir.join(LEGACY_TRIGGER);
     let actions = dir.join(LEGACY_ACTIONS);
     while !stop.load(Ordering::Relaxed) {
@@ -418,10 +513,9 @@ fn watch_legacy_files(dir: &Path, tx: &Sender<Command>, ctx: &egui::Context, sto
         }
         let cmd = parse_legacy(&text)
             .unwrap_or_else(|| Command::Log(format!("unreadable action: {}", text.trim())));
-        if tx.send(cmd).is_err() {
+        if !sink.send(cmd) {
             break;
         }
-        ctx.request_repaint();
     }
 }
 
@@ -456,6 +550,56 @@ mod tests {
             parse_legacy("[0,'temp\\\\a.gif','0-(0,0)']"),
             Some(Command::Hide { slot: "main".into() })
         );
+    }
+
+    #[test]
+    fn moves_bypass_the_app_only_when_in_order() {
+        let show = || Command::Show {
+            slot: "main".into(),
+            file: "a.gif".into(),
+            x: None,
+            y: None,
+            anchor: Anchor::Center,
+            scale: None,
+            flip_h: false,
+            click_through: true,
+            draggable: false,
+        };
+        let moved = || Command::Move {
+            slot: "main".into(),
+            x: 100.0,
+            y: 50.0,
+            anchor: Anchor::Center,
+        };
+        let (events, _) = unbounded();
+        let anim = Arc::new(Mutex::new(crate::media::Anim::test_dummy()));
+        let overlay = Arc::new(Mutex::new(overlay::Shared {
+            key: overlay::OverlayKey::Item(1),
+            anim,
+            look: Default::default(),
+            playback: Default::default(),
+            window: Default::default(),
+            move_to: None,
+            reported_pos: None,
+            events,
+            ctx: egui::Context::default(),
+        }));
+
+        let mut live = Live::default();
+        // Not displayed yet: everything goes through the app.
+        let cmd = live.route(show()).unwrap();
+        assert!(live.route(moved()).is_some());
+        live.publish("main", &overlay, Vec2::new(20.0, 10.0));
+        // The show hasn't been applied by the app: still not published.
+        assert!(live.route(moved()).is_some());
+        live.applied(&cmd);
+        live.publish("main", &overlay, Vec2::new(20.0, 10.0));
+        // Now moves are applied directly, relative to the center.
+        assert!(live.route(moved()).is_none());
+        assert_eq!(overlay.lock().unwrap().move_to, Some(Pos2::new(90.0, 45.0)));
+        // A new show unpublishes the slot until the app applies it.
+        assert!(live.route(show()).is_some());
+        assert!(live.route(moved()).is_some());
     }
 
     #[test]

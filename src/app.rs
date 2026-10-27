@@ -660,6 +660,9 @@ impl App {
                 }
             }
             for cmd in commands {
+                if let Some(running) = &b.running {
+                    running.live.lock().unwrap().applied(&cmd);
+                }
                 apply_command(b, cmd, master, &self.audio, ctx, &ffmpeg, &cache_dir);
             }
             if exited {
@@ -734,11 +737,19 @@ impl App {
                         ctx: ctx.clone(),
                     })));
                 }
-                if !hidden && let Some(overlay) = &slot.overlay {
-                    self.overlays.show(ctx, overlay, slot.spawn_pos);
+                if let Some(overlay) = &slot.overlay {
+                    if let Some(running) = &b.running {
+                        running.live.lock().unwrap().publish(name, overlay, size);
+                    }
+                    if !hidden {
+                        self.overlays.show(ctx, overlay, slot.spawn_pos);
+                    }
                 }
             }
             for name in failed {
+                if let Some(running) = &b.running {
+                    running.live.lock().unwrap().unpublish(&name);
+                }
                 if let Some(slot) = b.slots.remove(&name) {
                     b.log(format!("⚠ cannot load {}", slot.key.path.display()));
                 }
