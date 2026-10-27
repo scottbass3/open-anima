@@ -15,6 +15,8 @@ pub struct Dirs {
     pub library: PathBuf,
     /// Extracted behavior packages.
     pub packages: PathBuf,
+    /// Helper programs downloaded on demand (SteamCMD).
+    pub tools: PathBuf,
     /// Throw-away files (audio tracks extracted from videos, …).
     pub cache: PathBuf,
 }
@@ -28,6 +30,7 @@ impl Dirs {
             config_file: dirs.config_dir().join("config.json"),
             library: data.join("library"),
             packages: data.join("packages"),
+            tools: data.join("tools"),
             cache: dirs.cache_dir().to_path_buf(),
         };
         for dir in [
@@ -66,6 +69,8 @@ pub struct Config {
     pub active_behaviors: Vec<PathBuf>,
     /// Tab of the panel shown last.
     pub tab: crate::app::Tab,
+    /// Steam account name used with SteamCMD, when anonymous downloads are refused.
+    pub steam_account: String,
 }
 
 impl Default for Config {
@@ -83,6 +88,7 @@ impl Default for Config {
             trusted: Vec::new(),
             active_behaviors: Vec::new(),
             tab: Default::default(),
+            steam_account: String::new(),
         }
     }
 }

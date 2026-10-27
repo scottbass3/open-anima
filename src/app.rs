@@ -17,6 +17,7 @@ use crate::jobs::{Job, JobDone};
 use crate::media::{self, Anim, LoadRequest, LoadResult, decode::MediaKind};
 use crate::overlay::{self, OverlayEvent, OverlayKey, Overlays, Shared, SharedRef};
 use crate::tray::{Tray, TrayMsg};
+use crate::workshop::{self, Details, Imported};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
@@ -130,6 +131,50 @@ pub struct CardImage {
     pub next: Option<f64>,
 }
 
+type Lookup = Result<(Details, Option<egui::ColorImage>), String>;
+
+/// The "import from the Workshop" dialog.
+#[derive(Default)]
+pub struct Workshop {
+    pub open: bool,
+    pub link: String,
+    pub details: Option<Details>,
+    pub preview: Option<egui::TextureHandle>,
+    /// Where Steam keeps the files of the item, once downloaded.
+    pub local: Option<PathBuf>,
+    /// Whether the game the item belongs to is installed in Steam.
+    pub app_installed: bool,
+    pub error: Option<String>,
+    /// Set while waiting for Steam to download the item after the user subscribed.
+    pub waiting_since: Option<Instant>,
+    lookup: Option<Receiver<Lookup>>,
+    importing: Option<Receiver<Result<Imported, String>>>,
+    steamcmd: Option<Receiver<Result<PathBuf, String>>>,
+    /// Last line printed by SteamCMD.
+    pub steamcmd_status: Arc<Mutex<String>>,
+    /// The anonymous SteamCMD download failed: offer to log in.
+    pub steamcmd_needs_login: bool,
+    libraries: Vec<PathBuf>,
+    last_poll: Option<Instant>,
+}
+
+impl Workshop {
+    pub fn looking_up(&self) -> bool {
+        self.lookup.is_some()
+    }
+
+    pub fn importing(&self) -> bool {
+        self.importing.is_some()
+    }
+
+    pub fn steamcmd_running(&self) -> bool {
+        self.steamcmd.is_some()
+    }
+}
+
+/// Give up waiting for Steam after this long.
+const WORKSHOP_WAIT: Duration = Duration::from_secs(20 * 60);
+
 pub struct Notice {
     pub text: String,
     pub error: bool,
@@ -162,6 +207,7 @@ pub struct App {
     pub confirm_run: Option<usize>,
     pub notice: Option<Notice>,
     pub search: String,
+    pub workshop: Workshop,
     /// Still thumbnails of the items that are not loaded, keyed by what they were made from.
     thumbs: HashMap<u64, ((PathBuf, DecodeOptions), Thumb)>,
 }
@@ -215,6 +261,7 @@ impl App {
             confirm_run: None,
             notice: None,
             search: String::new(),
+            workshop: Workshop::default(),
             thumbs: HashMap::new(),
         };
         app.selected = app.cfg.items.first().map(|i| i.id);
@@ -410,6 +457,237 @@ impl App {
             Err(err) => log::error!("saving config: {err:#}"),
         }
         self.last_save = Instant::now();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Workshop
+
+    pub fn workshop_lookup(&mut self, ctx: &egui::Context) {
+        let ws = &mut self.workshop;
+        let link = ws.link.clone();
+        *ws = Workshop {
+            open: true,
+            link,
+            ..Default::default()
+        };
+        let Some(id) = workshop::parse_id(&ws.link) else {
+            ws.error = Some(self.cfg.lang.t("ws_bad_link").to_owned());
+            return;
+        };
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = workshop::fetch_details(id).map_err(|e| format!("{e:#}")).map(|d| {
+                let preview = d
+                    .preview_url
+                    .as_deref()
+                    .and_then(|url| workshop::fetch_preview(url).ok());
+                (d, preview)
+            });
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        ws.lookup = Some(rx);
+        ws.libraries = workshop::steam_libraries();
+        // Items downloaded earlier with SteamCMD.
+        ws.libraries.push(self.dirs.tools.join("steamcmd"));
+    }
+
+    /// Opens the item in Steam and waits for its download.
+    pub fn workshop_subscribe(&mut self) {
+        let Some(details) = &self.workshop.details else { return };
+        self.workshop_wait(workshop::open_in_steam(details.id));
+    }
+
+    /// Downloads the item with SteamCMD, anonymously or with the user's account.
+    pub fn workshop_steamcmd(&mut self, ctx: &egui::Context, with_account: bool) {
+        let Some(details) = self.workshop.details.clone() else { return };
+        let account = with_account
+            .then(|| self.cfg.steam_account.trim().to_owned())
+            .filter(|a| !a.is_empty());
+        let dir = self.dirs.tools.join("steamcmd");
+        let status = self.workshop.steamcmd_status.clone();
+        *status.lock().unwrap() = String::new();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let progress = |line: String| {
+                *status.lock().unwrap() = line;
+                ctx.request_repaint();
+            };
+            let result = workshop::steamcmd_download(
+                &dir,
+                details.app_id,
+                details.id,
+                account.as_deref(),
+                &progress,
+            )
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        let ws = &mut self.workshop;
+        ws.steamcmd = Some(rx);
+        ws.waiting_since = None;
+        ws.error = None;
+    }
+
+    /// Asks Steam to install the game, after which it downloads the subscribed items.
+    pub fn workshop_install_app(&mut self) {
+        let Some(details) = &self.workshop.details else { return };
+        self.workshop_wait(workshop::install_in_steam(details.app_id));
+    }
+
+    fn workshop_wait(&mut self, opened: anyhow::Result<()>) {
+        match opened {
+            Ok(()) => {
+                self.workshop.waiting_since = Some(Instant::now());
+                self.workshop.error = None;
+            }
+            Err(err) => self.workshop.error = Some(format!("{err:#}")),
+        }
+    }
+
+    pub fn workshop_import(&mut self, ctx: &egui::Context) {
+        let ws = &mut self.workshop;
+        let Some(details) = ws.details.clone() else { return };
+        let local = ws.local.clone();
+        let (library, packages) = (self.dirs.library.clone(), self.dirs.packages.clone());
+        let download_dir = self.dirs.cache.join("workshop").join(details.id.to_string());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let source = match local {
+                    Some(dir) => dir,
+                    None => {
+                        workshop::download_legacy(&details, &download_dir)?;
+                        download_dir
+                    }
+                };
+                workshop::import(&source, &details, &library, &packages)
+            })()
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        ws.importing = Some(rx);
+        ws.waiting_since = None;
+        ws.error = None;
+    }
+
+    fn poll_workshop(&mut self, ctx: &egui::Context) {
+        let lang = self.cfg.lang;
+        let ws = &mut self.workshop;
+        if let Some(rx) = &ws.lookup
+            && let Ok(result) = rx.try_recv()
+        {
+            ws.lookup = None;
+            match result {
+                Ok((details, preview)) => {
+                    ws.preview = preview.map(|image| {
+                        ctx.load_texture("workshop-preview", image, egui::TextureOptions::LINEAR)
+                    });
+                    ws.local = workshop::local_item(&ws.libraries, details.app_id, details.id);
+                    ws.app_installed = workshop::app_installed(&ws.libraries, details.app_id);
+                    ws.details = Some(details);
+                }
+                Err(err) => ws.error = Some(err),
+            }
+        }
+
+        if let (Some(since), Some(details)) = (ws.waiting_since, &ws.details) {
+            if since.elapsed() > WORKSHOP_WAIT {
+                ws.waiting_since = None;
+                ws.error = Some(lang.t("ws_timeout").to_owned());
+            } else if ws.last_poll.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
+                ws.last_poll = Some(Instant::now());
+                // Steam only moves an item to its content folder once fully downloaded.
+                ws.local = workshop::local_item(&ws.libraries, details.app_id, details.id);
+                ws.app_installed = workshop::app_installed(&ws.libraries, details.app_id);
+                if ws.local.is_some() {
+                    self.workshop_import(ctx);
+                    return;
+                }
+            }
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+
+        let ws = &mut self.workshop;
+        if let Some(rx) = &ws.steamcmd
+            && let Ok(result) = rx.try_recv()
+        {
+            ws.steamcmd = None;
+            match result {
+                Ok(dir) => {
+                    ws.local = Some(dir);
+                    self.workshop_import(ctx);
+                    return;
+                }
+                Err(err) => {
+                    ws.steamcmd_needs_login = true;
+                    ws.error = Some(err);
+                }
+            }
+        }
+
+        let ws = &mut self.workshop;
+        if let Some(rx) = &ws.importing
+            && let Ok(result) = rx.try_recv()
+        {
+            ws.importing = None;
+            match result {
+                Ok(imported) => self.finish_workshop_import(ctx, imported),
+                Err(err) => self.workshop.error = Some(err),
+            }
+        }
+    }
+
+    fn finish_workshop_import(&mut self, ctx: &egui::Context, imported: Imported) {
+        let title = self
+            .workshop
+            .details
+            .as_ref()
+            .map(|d| d.title.clone())
+            .unwrap_or_default();
+        if imported.media.is_empty() && imported.behaviors.is_empty() {
+            self.workshop.error = Some(self.t("ws_nothing").to_owned());
+            return;
+        }
+        let count = imported.media.len();
+        let mut first = None;
+        for (n, path) in imported.media.iter().enumerate() {
+            let id = self.cfg.add_item(path.clone());
+            if let Some(item) = self.cfg.item_mut(id)
+                && !title.is_empty()
+            {
+                item.name = if count == 1 {
+                    title.clone()
+                } else {
+                    format!("{title} {}", n + 1)
+                };
+            }
+            first.get_or_insert(id);
+        }
+        for dir in &imported.behaviors {
+            self.add_behavior_dir(ctx, dir.clone());
+        }
+        if let Some(id) = first {
+            self.selected = Some(id);
+            self.tab = Tab::Library;
+        }
+        let mut text = format!(
+            "{} — {} : {count}, {} : {}",
+            self.t("ws_imported"),
+            self.t("tab_library"),
+            self.t("tab_behaviors"),
+            imported.behaviors.len()
+        );
+        if !imported.unsupported.is_empty() {
+            text.push_str(&format!(" ({} : {})", self.t("ws_unsupported"), imported.unsupported.len()));
+        }
+        self.notify(text, false);
+        self.workshop = Workshop::default();
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1025,6 +1303,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events(ctx);
         self.poll_jobs();
+        self.poll_workshop(ctx);
         self.sync_items(ctx);
         self.sync_behaviors(ctx);
         self.overlays.flush();

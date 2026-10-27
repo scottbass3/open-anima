@@ -28,6 +28,7 @@ mod overlay;
 mod process;
 mod theme;
 mod tray;
+mod workshop;
 mod ui;
 
 use eframe::egui;
@@ -35,7 +36,13 @@ use eframe::egui;
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let start_hidden = std::env::args().any(|a| a == "--minimized");
+    let args: Vec<String> = std::env::args().collect();
+    let start_hidden = args.iter().any(|a| a == "--minimized");
+    // `--workshop <link>` opens the Workshop import dialog on that item.
+    let workshop_link = args
+        .iter()
+        .position(|a| a == "--workshop")
+        .and_then(|i| args.get(i + 1).cloned());
     let dirs = config::Dirs::new().unwrap_or_else(|err| {
         eprintln!("Open Anima: {err:#}");
         std::process::exit(1);
@@ -60,6 +67,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Open Anima",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, dirs, start_hidden)))),
+        Box::new(move |cc| {
+            let mut app = app::App::new(cc, dirs, start_hidden);
+            if let Some(link) = workshop_link {
+                app.workshop.link = link;
+                app.workshop_lookup(&cc.egui_ctx);
+            }
+            Ok(Box::new(app))
+        }),
     )
 }

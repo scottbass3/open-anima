@@ -28,6 +28,14 @@ Open Anima is free software written in Rust, licensed under the
   used by other desktop animation tools (`temp/actions.mddo` + `activador.act`) is also
   understood, so existing packs can be run by loading their folder. See
   [docs/behaviors.md](docs/behaviors.md).
+- **Steam Workshop import**: paste the link of an Anima Engine Workshop item. Open Anima shows
+  it and downloads it with [SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD),
+  Valve's command line client, which it fetches on first use: no need to install Anima Engine.
+  Downloads are anonymous when Steam allows it; otherwise SteamCMD opens its own window for you
+  to log in with an account that owns the game (Open Anima never sees the password). You can
+  also subscribe in the Steam client: items it has downloaded are imported right away.
+  Animations and behaviors are copied into the library. `open-anima --workshop <link>` opens
+  the dialog directly.
 - **Desktop integration**: tray icon (show the panel, hide all animations, quit), start with
   Windows, drag & drop files onto the panel, English and French interface.
 

@@ -51,6 +51,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
 
     confirm_dialog(app, &ctx);
+    workshop_dialog(app, &ctx);
     drop_overlay(app, &ctx);
     resize_handles(ui);
 }
@@ -527,6 +528,13 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 if ui.add(primary_button(app.t("add_animations"))).clicked() {
                     pick_media(app, &ctx);
+                }
+                if ui
+                    .add(ghost_button(app.t("workshop")))
+                    .on_hover_text(app.t("ws_title"))
+                    .clicked()
+                {
+                    app.workshop.open = true;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let mut visible = !app.cfg.overlays_hidden;
@@ -1297,6 +1305,211 @@ fn confirm_dialog(app: &mut App, ctx: &egui::Context) {
         if run {
             app.run_behavior(ctx, index, true);
         }
+    }
+}
+
+fn workshop_dialog(app: &mut App, ctx: &egui::Context) {
+    if !app.workshop.open {
+        return;
+    }
+    let lang = app.lang();
+    let t = |k| lang.t(k);
+    let mut close = false;
+    let mut action = None;
+    let modal = egui::Modal::new(Id::new("workshop"))
+        .frame(
+            Frame::new()
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CARD_RADIUS)
+                .inner_margin(Margin::same(22)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.label(RichText::new(t("ws_title")).font(semibold(19.0)).color(TEXT));
+            ui.label(RichText::new(t("ws_intro")).color(TEXT_DIM));
+            ui.add_space(8.0);
+
+            let account = &mut app.cfg.steam_account;
+            let ws = &mut app.workshop;
+            let busy = ws.looking_up() || ws.importing() || ws.steamcmd_running();
+            ui.horizontal(|ui| {
+                let field = ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(&mut ws.link)
+                        .hint_text("https://steamcommunity.com/sharedfiles/filedetails/?id=…")
+                        .desired_width(ui.available_width() - 110.0)
+                        .margin(Margin::symmetric(10, 8)),
+                );
+                let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let button = ui.add_enabled(
+                    !busy && !ws.link.trim().is_empty(),
+                    ghost_button(t("ws_look_up")).min_size(Vec2::new(100.0, 34.0)),
+                );
+                if enter || button.clicked() {
+                    action = Some("lookup");
+                }
+            });
+            ui.add_space(6.0);
+
+            if ws.looking_up() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(t("ws_looking_up")).color(TEXT_DIM));
+                });
+            }
+            if let Some(details) = &ws.details {
+                card_frame().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(112.0), Sense::hover());
+                        checkerboard(ui.painter(), rect, RADIUS);
+                        if let Some(tex) = &ws.preview {
+                            paint_fit(ui.painter(), rect.shrink(4.0), tex.id(), tex.size_vec2(), Color32::WHITE);
+                        }
+                        ui.vertical(|ui| {
+                            ui.add(egui::Label::new(
+                                RichText::new(&details.title).font(semibold(16.0)).color(TEXT),
+                            ).wrap());
+                            let size = if details.size > 0 {
+                                format!("{:.1} MB  ·  ", details.size as f64 / 1_000_000.0)
+                            } else {
+                                String::new()
+                            };
+                            ui.label(RichText::new(format!("{size}#{}", details.id)).small().color(TEXT_DIM));
+                            if details.app_id != crate::workshop::ANIMA_ENGINE_APP {
+                                ui.label(RichText::new(t("ws_other_app")).small().color(WARNING));
+                            }
+                        });
+                    });
+                });
+                ui.add_space(8.0);
+
+                if ws.importing() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(t("ws_importing")).color(TEXT));
+                    });
+                } else if ws.steamcmd_running() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(t("ws_steamcmd_running")).color(TEXT));
+                    });
+                    let status = ws.steamcmd_status.lock().unwrap().clone();
+                    let status = if status.is_empty() { t("ws_steamcmd_window").to_owned() } else { status };
+                    ui.add(egui::Label::new(RichText::new(status).monospace().small().color(TEXT_DIM)).truncate());
+                } else if ws.waiting_since.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(t("ws_waiting")).color(TEXT));
+                    });
+                    let hint = if ws.app_installed { t("ws_waiting_hint") } else { t("ws_waiting_install") };
+                    ui.label(RichText::new(hint).small().color(TEXT_DIM));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(ghost_button(t("ws_open_again"))).clicked() {
+                            action = Some("subscribe");
+                        }
+                        if !ws.app_installed && ui.add(ghost_button(t("ws_install_app"))).clicked() {
+                            action = Some("install");
+                        }
+                        if ui.add(ghost_button(t("cancel"))).clicked() {
+                            action = Some("cancel_wait");
+                        }
+                    });
+                } else if ws.local.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("●").color(SUCCESS));
+                        ui.label(RichText::new(t("ws_found_local")).color(TEXT));
+                    });
+                    if wide(ui, primary_button(t("ws_import"))).clicked() {
+                        action = Some("import");
+                    }
+                } else if details.file_url.is_some() {
+                    if wide(ui, primary_button(t("ws_download"))).clicked() {
+                        action = Some("import");
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("●").color(WARNING));
+                        ui.label(RichText::new(t("ws_not_local")).color(TEXT));
+                    });
+                    if crate::workshop::steamcmd_supported() {
+                        ui.label(RichText::new(t("ws_steamcmd_hint")).small().color(TEXT_DIM));
+                        ui.add_space(4.0);
+                        if wide(ui, primary_button(t("ws_steamcmd"))).clicked() {
+                            action = Some("steamcmd");
+                        }
+                        if ws.steamcmd_needs_login {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(t("ws_steamcmd_login_hint")).small().color(TEXT_DIM));
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(account)
+                                        .hint_text(t("ws_account"))
+                                        .desired_width(ui.available_width() - 190.0)
+                                        .margin(Margin::symmetric(10, 8)),
+                                );
+                                let ok = !account.trim().is_empty();
+                                if ui
+                                    .add_enabled(ok, ghost_button(t("ws_steamcmd_login")).min_size(Vec2::new(180.0, 34.0)))
+                                    .clicked()
+                                {
+                                    action = Some("steamcmd_login");
+                                }
+                            });
+                        }
+                        ui.add_space(10.0);
+                        caption(ui, t("ws_or_steam"));
+                    }
+                    ui.label(RichText::new(t("ws_needs_owner")).small().color(TEXT_DIM));
+                    ui.add_space(4.0);
+                    if ws.app_installed {
+                        if wide(ui, primary_button(t("ws_subscribe"))).clicked() {
+                            action = Some("subscribe");
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("●").color(WARNING));
+                            ui.label(RichText::new(t("ws_app_missing")).color(TEXT));
+                        });
+                        ui.add_space(4.0);
+                        if wide(ui, primary_button(t("ws_install_app"))).clicked() {
+                            action = Some("install");
+                        }
+                        if wide(ui, ghost_button(t("ws_subscribe"))).clicked() {
+                            action = Some("subscribe");
+                        }
+                    }
+                }
+            }
+            if let Some(err) = &ws.error {
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("⚠  {err}")).color(DANGER));
+            }
+            ui.add_space(10.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(ghost_button(t("close"))).clicked() {
+                    close = true;
+                }
+            });
+        });
+    if modal.should_close() {
+        close = true;
+    }
+    match action {
+        Some("lookup") => app.workshop_lookup(ctx),
+        Some("subscribe") => app.workshop_subscribe(),
+        Some("install") => app.workshop_install_app(),
+        Some("steamcmd") => app.workshop_steamcmd(ctx, false),
+        Some("steamcmd_login") => app.workshop_steamcmd(ctx, true),
+        Some("import") => app.workshop_import(ctx),
+        Some("cancel_wait") => app.workshop.waiting_since = None,
+        _ => {}
+    }
+    if close {
+        // An ongoing wait or import carries on in the background.
+        app.workshop.open = false;
     }
 }
 

@@ -63,7 +63,7 @@ pub fn apply(ctx: &egui::Context) {
 }
 
 /// Segoe UI from Windows when available (it isn't redistributed), egui's fonts otherwise.
-/// egui's own fonts stay as fallbacks for the icons and emojis.
+/// egui's own fonts stay as fallbacks for the icons and emojis, then Windows' CJK fonts.
 fn fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let defaults = fonts.families[&FontFamily::Proportional].clone();
@@ -87,6 +87,16 @@ fn fonts() -> FontDefinitions {
         bold.insert(0, "segoe-semibold".into());
     } else {
         bold = regular.clone();
+    }
+    // Workshop titles are often Japanese or Korean.
+    for (name, file) in [("cjk-ja", "msgothic.ttc"), ("cjk-ko", "malgun.ttf")] {
+        if let Some(data) = load(file) {
+            fonts
+                .font_data
+                .insert(name.into(), Arc::new(FontData::from_owned(data)));
+            regular.push(name.into());
+            bold.push(name.into());
+        }
     }
     fonts.families.insert(FontFamily::Proportional, regular);
     fonts.families.insert(FontFamily::Name(SEMIBOLD.into()), bold);
